@@ -2,7 +2,7 @@
 
 轻量油猴脚本：在指定网站上自动翻译匹配选择器中的图片。
 
-依赖 [Cotrans](https://cotrans.touhou.ai/) 图片翻译服务。脚本会下载原图、提交翻译、轮询结果，并在浏览器本地合成最终图片。
+默认配置使用 https://cotrans.touhou.ai/ 图片翻译服务。脚本会下载原图、提交翻译、轮询结果，并在浏览器本地合成最终图片。
 
 ## 功能
 
@@ -15,9 +15,8 @@
 
 ## 安装
 
-1. 安装 Tampermonkey 或 Violentmonkey
-2. 导入 `auto-image-translator.user.js`
-3. 在脚本配置里填写站点规则
+1. 使用脚本管理器导入 `auto-image-translator.user.js`
+2. 在脚本配置里填写站点规则
 
 ## 站点规则
 
@@ -66,14 +65,12 @@ x.com|article img
 时间戳_小数_哈希值.后缀名
 ```
 
-例如：
-
-```text
-1712345678901_001_abcd1234.png
-```
-
 ## 说明
 
 - 主要面向普通网页中的 `img` 元素
 - 不处理 `background-image` 等非 `img` 场景
 - 翻译效果和可用性依赖目标站点、原图质量与 Cotrans 服务
+
+---
+
+友链: https://linux.do/
