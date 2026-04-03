@@ -14,16 +14,15 @@
 // @grant        GM_xmlhttpRequest
 // @grant        GM.getValue
 // @grant        GM_getValue
+// @grant        GM.setValue
+// @grant        GM_setValue
+// @grant        GM.registerMenuCommand
+// @grant        GM_registerMenuCommand
 // @run-at       document-idle
 // ==/UserScript==
 
 /* ==UserConfig==
 basic:
-  apiBaseUrl:
-    title: API 地址
-    description: Cotrans API 基础地址
-    type: text
-    default: https://api.cotrans.touhou.ai
   pollInterval:
     title: 轮询间隔
     description: 查询翻译任务状态的轮询间隔
@@ -48,6 +47,18 @@ basic:
     min: 512
     max: 8192
     unit: px
+  recentImageCacheSize:
+    title: 最近图片缓存数
+    description: 缓存最近翻译结果的图片数量，0 表示禁用
+    type: number
+    default: 100
+    min: 0
+translation:
+  apiBaseUrl:
+    title: API 地址
+    description: Cotrans API 基础地址
+    type: text
+    default: https://api.cotrans.touhou.ai
   requestTimeout:
     title: 请求超时
     description: 单次网络请求超时时间
@@ -56,7 +67,6 @@ basic:
     min: 5000
     max: 600000
     unit: ms
-translation:
   targetLanguage:
     title: 目标语言
     description: 翻译目标语言代码，例如 CHS、CHT、JPN、ENG
@@ -131,6 +141,7 @@ const DEFAULT_CONFIG = {
   pollTimeout: 300000,
   maxImageSize: 4096,
   requestTimeout: 120000,
+  recentImageCacheSize: 100,
   targetLanguage: 'CHS',
   translator: 'gpt3.5',
   textDetector: 'default',
@@ -152,6 +163,30 @@ function getGMValueAccessor() {
 }
 
 const getGMValue = getGMValueAccessor()
+
+function getGMSetValueAccessor() {
+  if (typeof GM !== 'undefined' && typeof GM.setValue === 'function') {
+    return (key, value) => GM.setValue(key, value)
+  }
+  if (typeof GM_setValue === 'function') {
+    return (key, value) => Promise.resolve(GM_setValue(key, value))
+  }
+  return () => Promise.resolve()
+}
+
+const setGMValue = getGMSetValueAccessor()
+
+function getGMRegisterMenuCommandAccessor() {
+  if (typeof GM !== 'undefined' && typeof GM.registerMenuCommand === 'function') {
+    return GM.registerMenuCommand.bind(GM)
+  }
+  if (typeof GM_registerMenuCommand === 'function') {
+    return GM_registerMenuCommand
+  }
+  return null
+}
+
+const registerMenuCommand = getGMRegisterMenuCommandAccessor()
 
 function toNumber(value, fallback) {
   const nextValue = Number(value)
@@ -182,12 +217,13 @@ function parseSiteRules(rulesText) {
 }
 
 async function loadConfig() {
+  const apiBaseUrl = await getGMValue('translation.apiBaseUrl', await getGMValue('basic.apiBaseUrl', DEFAULT_CONFIG.apiBaseUrl))
+  const requestTimeout = await getGMValue('translation.requestTimeout', await getGMValue('basic.requestTimeout', DEFAULT_CONFIG.requestTimeout))
   const [
-    apiBaseUrl,
     pollInterval,
     pollTimeout,
     maxImageSize,
-    requestTimeout,
+    recentImageCacheSize,
     targetLanguage,
     translator,
     textDetector,
@@ -196,11 +232,10 @@ async function loadConfig() {
     forceRetry,
     rulesText,
   ] = await Promise.all([
-    getGMValue('basic.apiBaseUrl', DEFAULT_CONFIG.apiBaseUrl),
     getGMValue('basic.pollInterval', DEFAULT_CONFIG.pollInterval),
     getGMValue('basic.pollTimeout', DEFAULT_CONFIG.pollTimeout),
     getGMValue('basic.maxImageSize', DEFAULT_CONFIG.maxImageSize),
-    getGMValue('basic.requestTimeout', DEFAULT_CONFIG.requestTimeout),
+    getGMValue('basic.recentImageCacheSize', DEFAULT_CONFIG.recentImageCacheSize),
     getGMValue('translation.targetLanguage', DEFAULT_CONFIG.targetLanguage),
     getGMValue('translation.translator', DEFAULT_CONFIG.translator),
     getGMValue('translation.textDetector', DEFAULT_CONFIG.textDetector),
@@ -218,6 +253,7 @@ async function loadConfig() {
     pollTimeout: toNumber(pollTimeout, DEFAULT_CONFIG.pollTimeout),
     maxImageSize: toNumber(maxImageSize, DEFAULT_CONFIG.maxImageSize),
     requestTimeout: toNumber(requestTimeout, DEFAULT_CONFIG.requestTimeout),
+    recentImageCacheSize: Math.max(0, Math.floor(toNumber(recentImageCacheSize, DEFAULT_CONFIG.recentImageCacheSize))),
     targetLanguage: String(targetLanguage || DEFAULT_CONFIG.targetLanguage),
     translator: String(translator || DEFAULT_CONFIG.translator),
     textDetector: String(textDetector || DEFAULT_CONFIG.textDetector),
@@ -231,10 +267,19 @@ async function loadConfig() {
 
 let CONFIG
 
+const PERSISTENT_CACHE_DB_NAME = 'auto-image-translator-cache'
+const PERSISTENT_CACHE_STORE_NAME = 'translated-images'
+const PERSISTENT_CACHE_DB_VERSION = 2
+
 const translationTaskCache = new Map()
+const translatedImageCache = new Map()
 const elementSourceCache = new WeakMap()
 const processingElements = new WeakSet()
-const translatedElements = new WeakSet()
+let persistentCacheDbPromise
+let lastRequestedAtPromise
+let cacheGeneration = 0
+let currentRule = null
+let siteTranslationEnabled = true
 let progressPanel
 let hintStyleInstalled = false
 let translationProgress = {
@@ -244,6 +289,24 @@ let translationProgress = {
 
 function log(...args) {
   console.log('[Auto Image Translator]', ...args)
+}
+
+function notify(message) {
+  log(message)
+}
+
+function getSiteTranslationDisabledKey() {
+  return `site.disabled.${location.hostname}`
+}
+
+async function loadSiteTranslationEnabled() {
+  const disabled = await getGMValue(getSiteTranslationDisabledKey(), false)
+  return !parseBoolean(disabled, false)
+}
+
+async function setSiteTranslationEnabled(enabled) {
+  siteTranslationEnabled = enabled
+  await setGMValue(getSiteTranslationDisabledKey(), !enabled)
 }
 
 function ensureHintStyle() {
@@ -317,15 +380,13 @@ function renderProgressPanel() {
 }
 
 function beginTranslationFor(img) {
-  if (translatedElements.has(img) || processingElements.has(img)) return false
+  if (processingElements.has(img)) return false
   translationProgress.total += 1
   renderProgressPanel()
   return true
 }
 
 function finishTranslationFor(img) {
-  if (translatedElements.has(img)) return
-  translatedElements.add(img)
   translationProgress.done += 1
   renderProgressPanel()
 }
@@ -386,6 +447,373 @@ function getFileSuffix(url) {
   } catch (error) {
     return 'png'
   }
+}
+
+function requestToPromise(request, label) {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result)
+    request.onerror = () => reject(request.error || new Error(`[Auto Image Translator] ${label} failed`))
+  })
+}
+
+function transactionToPromise(transaction, label) {
+  return new Promise((resolve, reject) => {
+    transaction.oncomplete = () => resolve()
+    transaction.onerror = () => reject(transaction.error || new Error(`[Auto Image Translator] ${label} failed`))
+    transaction.onabort = () => reject(transaction.error || new Error(`[Auto Image Translator] ${label} aborted`))
+  })
+}
+
+function openPersistentCacheDb() {
+  if (persistentCacheDbPromise) return persistentCacheDbPromise
+  if (typeof indexedDB === 'undefined') {
+    persistentCacheDbPromise = Promise.resolve(null)
+    return persistentCacheDbPromise
+  }
+  persistentCacheDbPromise = new Promise((resolve, reject) => {
+    const request = indexedDB.open(PERSISTENT_CACHE_DB_NAME, PERSISTENT_CACHE_DB_VERSION)
+    request.onupgradeneeded = () => {
+      const db = request.result
+      const store = db.objectStoreNames.contains(PERSISTENT_CACHE_STORE_NAME)
+        ? request.transaction.objectStore(PERSISTENT_CACHE_STORE_NAME)
+        : db.createObjectStore(PERSISTENT_CACHE_STORE_NAME, { keyPath: 'cacheKey' })
+      if (!store.indexNames.contains('lastAccessedAt')) {
+        store.createIndex('lastAccessedAt', 'lastAccessedAt', { unique: false })
+      }
+      if (!store.indexNames.contains('requestedAt')) {
+        store.createIndex('requestedAt', 'requestedAt', { unique: false })
+      }
+    }
+    request.onsuccess = () => resolve(request.result)
+    request.onerror = () => reject(request.error || new Error('[Auto Image Translator] open persistent cache failed'))
+  })
+  return persistentCacheDbPromise.catch((error) => {
+    persistentCacheDbPromise = null
+    throw error
+  })
+}
+
+async function sha256Hex(blob) {
+  if (!crypto?.subtle) {
+    throw new Error('[Auto Image Translator] crypto.subtle is unavailable')
+  }
+  const buffer = await blob.arrayBuffer()
+  const digest = await crypto.subtle.digest('SHA-256', buffer)
+  const bytes = new Uint8Array(digest)
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
+function getPersistentCacheKey(imageHash) {
+  return [
+    imageHash,
+    CONFIG.targetLanguage,
+    CONFIG.translator,
+    CONFIG.textDetector,
+    CONFIG.renderTextOrientation,
+    CONFIG.detectionResolution,
+  ].join('|')
+}
+
+async function listPersistentCacheEntries() {
+  const db = await openPersistentCacheDb()
+  if (!db) return []
+  const transaction = db.transaction(PERSISTENT_CACHE_STORE_NAME, 'readonly')
+  const store = transaction.objectStore(PERSISTENT_CACHE_STORE_NAME)
+  const entries = await requestToPromise(store.getAll(), 'list persistent cache')
+  await transactionToPromise(transaction, 'list persistent cache')
+  return Array.isArray(entries) ? entries : []
+}
+
+async function getLatestRequestedAt() {
+  const db = await openPersistentCacheDb()
+  if (!db) return 0
+  const transaction = db.transaction(PERSISTENT_CACHE_STORE_NAME, 'readonly')
+  const store = transaction.objectStore(PERSISTENT_CACHE_STORE_NAME)
+  const index = store.index('requestedAt')
+  const latestRequestedAt = await new Promise((resolve, reject) => {
+    const request = index.openCursor(null, 'prev')
+    request.onsuccess = () => resolve(request.result?.value?.requestedAt || 0)
+    request.onerror = () => reject(request.error || new Error('[Auto Image Translator] read latest requestedAt failed'))
+  })
+  await transactionToPromise(transaction, 'read latest requestedAt')
+  return Number(latestRequestedAt) || 0
+}
+
+async function allocateRequestedAt() {
+  if (!lastRequestedAtPromise) {
+    lastRequestedAtPromise = getLatestRequestedAt()
+  }
+  const nextPromise = lastRequestedAtPromise.then((lastRequestedAt) => {
+    const now = Date.now()
+    const baseRequestedAt = Number(`${now}.001`)
+    if (baseRequestedAt > lastRequestedAt) {
+      return baseRequestedAt
+    }
+    return Number((lastRequestedAt + 0.001).toFixed(3))
+  })
+  lastRequestedAtPromise = nextPromise.catch(async () => getLatestRequestedAt())
+  return nextPromise
+}
+
+async function readPersistentCacheEntry(cacheKey) {
+  if (CONFIG.recentImageCacheSize <= 0) return null
+  const db = await openPersistentCacheDb()
+  if (!db) return null
+  const transaction = db.transaction(PERSISTENT_CACHE_STORE_NAME, 'readonly')
+  const store = transaction.objectStore(PERSISTENT_CACHE_STORE_NAME)
+  const entry = await requestToPromise(store.get(cacheKey), `read persistent cache ${cacheKey}`)
+  await transactionToPromise(transaction, `read persistent cache ${cacheKey}`)
+  return entry || null
+}
+
+async function touchPersistentCacheEntry(entry) {
+  if (!entry || CONFIG.recentImageCacheSize <= 0) return
+  const db = await openPersistentCacheDb()
+  if (!db) return
+  const transaction = db.transaction(PERSISTENT_CACHE_STORE_NAME, 'readwrite')
+  const store = transaction.objectStore(PERSISTENT_CACHE_STORE_NAME)
+  store.put({
+    ...entry,
+    lastAccessedAt: Date.now(),
+  })
+  await transactionToPromise(transaction, `touch persistent cache ${entry.cacheKey}`)
+}
+
+async function prunePersistentCache() {
+  if (CONFIG.recentImageCacheSize < 0) return
+  const db = await openPersistentCacheDb()
+  if (!db) return
+  const maxEntries = CONFIG.recentImageCacheSize
+  const transaction = db.transaction(PERSISTENT_CACHE_STORE_NAME, 'readwrite')
+  const store = transaction.objectStore(PERSISTENT_CACHE_STORE_NAME)
+  if (maxEntries === 0) {
+    store.clear()
+    await transactionToPromise(transaction, 'clear persistent cache')
+    return
+  }
+  const entryCount = await requestToPromise(store.count(), 'count persistent cache')
+  let excess = entryCount - maxEntries
+  if (excess <= 0) {
+    await transactionToPromise(transaction, 'prune persistent cache')
+    return
+  }
+  const index = store.index('lastAccessedAt')
+  await new Promise((resolve, reject) => {
+    const request = index.openCursor()
+    request.onsuccess = () => {
+      const cursor = request.result
+      if (!cursor || excess <= 0) {
+        resolve()
+        return
+      }
+      cursor.delete()
+      excess -= 1
+      cursor.continue()
+    }
+    request.onerror = () => reject(request.error || new Error('[Auto Image Translator] prune persistent cache failed'))
+  })
+  await transactionToPromise(transaction, 'prune persistent cache')
+}
+
+async function getPersistentTranslatedBlob(cacheKey) {
+  const entry = await readPersistentCacheEntry(cacheKey)
+  if (!entry?.blob) return null
+  await touchPersistentCacheEntry(entry)
+  return entry.blob
+}
+
+async function setPersistentTranslatedBlob(cacheKey, imageHash, translatedBlob) {
+  if (CONFIG.recentImageCacheSize <= 0) return
+  const db = await openPersistentCacheDb()
+  if (!db) return
+  const now = Date.now()
+  const requestedAt = await allocateRequestedAt()
+  const transaction = db.transaction(PERSISTENT_CACHE_STORE_NAME, 'readwrite')
+  const store = transaction.objectStore(PERSISTENT_CACHE_STORE_NAME)
+  store.put({
+    cacheKey,
+    imageHash,
+    blob: translatedBlob,
+    requestedAt,
+    createdAt: now,
+    lastAccessedAt: now,
+  })
+  await transactionToPromise(transaction, `write persistent cache ${cacheKey}`)
+  await prunePersistentCache()
+}
+
+function clearTranslatedImageCache() {
+  for (const translatedUrl of translatedImageCache.values()) {
+    URL.revokeObjectURL(translatedUrl)
+  }
+  translatedImageCache.clear()
+}
+
+function clearTranslationTaskCache() {
+  translationTaskCache.clear()
+}
+
+async function clearPersistentCache() {
+  const db = await openPersistentCacheDb()
+  if (!db) return
+  const transaction = db.transaction(PERSISTENT_CACHE_STORE_NAME, 'readwrite')
+  transaction.objectStore(PERSISTENT_CACHE_STORE_NAME).clear()
+  await transactionToPromise(transaction, 'clear persistent cache')
+  lastRequestedAtPromise = Promise.resolve(0)
+}
+
+function getBlobExtension(blob) {
+  const mimeType = blob?.type || 'image/png'
+  if (mimeType === 'image/jpeg') return 'jpg'
+  if (mimeType === 'image/webp') return 'webp'
+  if (mimeType === 'image/gif') return 'gif'
+  return 'png'
+}
+
+function blobToDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result || ''))
+    reader.onerror = () => reject(reader.error || new Error('[Auto Image Translator] blob to data url failed'))
+    reader.readAsDataURL(blob)
+  })
+}
+
+function downloadDataUrlWithAnchor(dataUrl, filename) {
+  const link = document.createElement('a')
+  link.href = dataUrl
+  link.download = filename
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+}
+
+async function downloadBlobFile(blob, filename) {
+  const dataUrl = await blobToDataUrl(blob)
+  downloadDataUrlWithAnchor(dataUrl, filename)
+}
+
+function formatRequestedAt(requestedAt) {
+  return Number(requestedAt).toFixed(3)
+}
+
+function getDownloadRequestedAt(entry, index) {
+  if (Number.isFinite(Number(entry?.requestedAt))) {
+    return Number(entry.requestedAt)
+  }
+  if (Number.isFinite(Number(entry?.createdAt))) {
+    return Number(`${Math.floor(Number(entry.createdAt))}.${String(index + 1).padStart(3, '0')}`)
+  }
+  return Number(`0.${String(index + 1).padStart(3, '0')}`)
+}
+
+async function downloadCachedTranslatedImages() {
+  const entries = await listPersistentCacheEntries()
+  const downloadableEntries = entries
+    .filter((entry) => entry?.blob instanceof Blob)
+    .map((entry, index) => ({
+      ...entry,
+      downloadRequestedAt: getDownloadRequestedAt(entry, index),
+    }))
+    .sort((left, right) => left.downloadRequestedAt - right.downloadRequestedAt)
+  if (!downloadableEntries.length) {
+    notify('[Auto Image Translator] 当前没有可下载的已翻译图片缓存')
+    return
+  }
+  for (const entry of downloadableEntries) {
+    const requestedAtText = formatRequestedAt(entry.downloadRequestedAt).replace('.', '_')
+    const extension = getBlobExtension(entry.blob)
+    const imageHash = typeof entry.imageHash === 'string' && entry.imageHash
+      ? entry.imageHash
+      : 'unknown'
+    await downloadBlobFile(entry.blob, `${requestedAtText}_${imageHash}.${extension}`)
+    await new Promise((resolve) => setTimeout(resolve, 80))
+  }
+  notify(`[Auto Image Translator] 已开始下载 ${downloadableEntries.length} 张已翻译图片`)
+}
+
+async function clearAllCaches() {
+  cacheGeneration += 1
+  clearTranslationTaskCache()
+  clearTranslatedImageCache()
+  await clearPersistentCache()
+  notify('[Auto Image Translator] 已清空翻译缓存')
+}
+
+function restoreOriginalImageElement(img) {
+  const originalUrl = elementSourceCache.get(img)
+  if (!originalUrl) return
+  img.src = originalUrl
+  img.removeAttribute('srcset')
+  elementSourceCache.delete(img)
+}
+
+function restoreOriginalImages(rule = currentRule, root = document) {
+  if (!rule) return
+  for (const img of collectMatchedImages(rule, root)) {
+    if (img instanceof HTMLImageElement) {
+      restoreOriginalImageElement(img)
+    }
+  }
+}
+
+async function toggleSiteTranslation() {
+  const nextEnabled = !siteTranslationEnabled
+  await setSiteTranslationEnabled(nextEnabled)
+  if (!nextEnabled) {
+    restoreOriginalImages()
+    log('site translation disabled', { hostname: location.hostname })
+    return
+  }
+  log('site translation enabled', { hostname: location.hostname })
+  if (currentRule) {
+    scheduleTranslate(currentRule)
+  }
+}
+
+function registerMenuCommands() {
+  if (!registerMenuCommand) return
+  registerMenuCommand('切换本站翻译', () => {
+    toggleSiteTranslation().catch((error) => log('toggle site translation failed', error))
+  })
+  registerMenuCommand('清空翻译缓存', () => {
+    clearAllCaches().catch((error) => log('clear cache failed', error))
+  })
+  registerMenuCommand('下载翻译图片', () => {
+    downloadCachedTranslatedImages().catch((error) => log('download translated images failed', error))
+  })
+}
+
+function getCachedTranslatedImageUrl(imageUrl) {
+  const cachedUrl = translatedImageCache.get(imageUrl)
+  if (!cachedUrl) return ''
+  translatedImageCache.delete(imageUrl)
+  translatedImageCache.set(imageUrl, cachedUrl)
+  return cachedUrl
+}
+
+function pruneTranslatedImageCache() {
+  while (translatedImageCache.size > CONFIG.recentImageCacheSize) {
+    const oldestEntry = translatedImageCache.entries().next()
+    if (oldestEntry.done) return
+    const [, cachedUrl] = oldestEntry.value
+    translatedImageCache.delete(oldestEntry.value[0])
+    URL.revokeObjectURL(cachedUrl)
+  }
+}
+
+function cacheTranslatedImageUrl(imageUrl, translatedUrl) {
+  if (CONFIG.recentImageCacheSize <= 0) {
+    return translatedUrl
+  }
+  const previousUrl = translatedImageCache.get(imageUrl)
+  if (previousUrl) {
+    translatedImageCache.delete(imageUrl)
+    URL.revokeObjectURL(previousUrl)
+  }
+  translatedImageCache.set(imageUrl, translatedUrl)
+  pruneTranslatedImageCache()
+  return translatedUrl
 }
 
 function shouldTranslate(img) {
@@ -522,16 +950,37 @@ async function mergeImages(baseBlob, maskBlob) {
 }
 
 async function translateImageUrl(imageUrl) {
-  if (translationTaskCache.has(imageUrl)) {
-    return translationTaskCache.get(imageUrl)
+  const cachedTask = translationTaskCache.get(imageUrl)
+  if (cachedTask?.generation === cacheGeneration) {
+    return cachedTask.promise
   }
+  const taskGeneration = cacheGeneration
   const task = (async () => {
+    if (!CONFIG.forceRetry && taskGeneration === cacheGeneration) {
+      const cachedTranslatedUrl = getCachedTranslatedImageUrl(imageUrl)
+      if (cachedTranslatedUrl) {
+        return cachedTranslatedUrl
+      }
+    }
     let originalBlob
     try {
       originalBlob = await downloadBlob(imageUrl)
     } catch (error) {
       const refererUrl = `${location.origin}/`
       originalBlob = await downloadBlob(imageUrl, { referer: refererUrl })
+    }
+    const imageHash = await sha256Hex(originalBlob)
+    const persistentCacheKey = getPersistentCacheKey(imageHash)
+    if (!CONFIG.forceRetry && taskGeneration === cacheGeneration) {
+      try {
+        const cachedBlob = await getPersistentTranslatedBlob(persistentCacheKey)
+        if (cachedBlob) {
+          const translatedUrl = URL.createObjectURL(cachedBlob)
+          return cacheTranslatedImageUrl(imageUrl, translatedUrl)
+        }
+      } catch (error) {
+        log('persistent cache read failed', imageUrl, error)
+      }
     }
     const originalSuffix = getFileSuffix(imageUrl)
     const resized = await resizeToSubmit(originalBlob, originalSuffix)
@@ -546,17 +995,33 @@ async function translateImageUrl(imageUrl) {
     }
     const maskBlob = await downloadBlob(maskUrl)
     const translatedBlob = await mergeImages(resized.blob, maskBlob)
-    return URL.createObjectURL(translatedBlob)
+    const translatedUrl = URL.createObjectURL(translatedBlob)
+    if (taskGeneration === cacheGeneration) {
+      try {
+        await setPersistentTranslatedBlob(persistentCacheKey, imageHash, translatedBlob)
+      } catch (error) {
+        log('persistent cache write failed', imageUrl, error)
+      }
+      return cacheTranslatedImageUrl(imageUrl, translatedUrl)
+    }
+    return translatedUrl
   })()
-  translationTaskCache.set(imageUrl, task)
+  translationTaskCache.set(imageUrl, {
+    generation: taskGeneration,
+    promise: task,
+  })
   try {
     return await task
   } finally {
-    translationTaskCache.delete(imageUrl)
+    const latestTask = translationTaskCache.get(imageUrl)
+    if (latestTask?.generation === taskGeneration && latestTask.promise === task) {
+      translationTaskCache.delete(imageUrl)
+    }
   }
 }
 
 async function translateImageElement(img) {
+  if (!siteTranslationEnabled) return
   if (!shouldTranslate(img)) return
   const imageUrl = getImageUrl(img)
   if (!imageUrl) return
@@ -567,6 +1032,7 @@ async function translateImageElement(img) {
   processingElements.add(img)
   try {
     const translatedUrl = await translateImageUrl(imageUrl)
+    if (!siteTranslationEnabled) return
     if (!img.isConnected) return
     if (getImageUrl(img) !== imageUrl) return
     img.src = translatedUrl
@@ -620,16 +1086,21 @@ function startObserver(rule) {
 
 async function main() {
   CONFIG = await loadConfig()
-  const rule = getMatchedRule()
-  if (!rule) {
+  siteTranslationEnabled = await loadSiteTranslationEnabled()
+  registerMenuCommands()
+  currentRule = getMatchedRule()
+  if (!currentRule) {
     log('no site rule matched')
     return
   }
-  scheduleTranslate(rule)
-  startObserver(rule)
+  if (siteTranslationEnabled) {
+    scheduleTranslate(currentRule)
+  }
+  startObserver(currentRule)
   log('started', {
     hostname: location.hostname,
-    selector: rule.selector,
+    selector: currentRule.selector,
+    enabled: siteTranslationEnabled,
   })
 }
 

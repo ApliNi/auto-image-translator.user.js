@@ -1,137 +1,79 @@
 # Lightweight Auto Image Translator
 
-一个轻量独立的油猴脚本，用于在指定网站上自动翻译匹配选择器中的图片。
+轻量油猴脚本：在指定网站上自动翻译匹配选择器中的图片。
 
-本项目使用了 [Cotrans](https://cotrans.touhou.ai/) 提供的图片翻译服务：
-- 提交图片到 `https://api.cotrans.touhou.ai/task/upload/v1`
-- 轮询翻译任务状态
-- 下载返回的 `translation_mask`
-- 在本地浏览器中将原图与翻译结果合成为最终图片
+依赖 [Cotrans](https://cotrans.touhou.ai/) 图片翻译服务。脚本会下载原图、提交翻译、轮询结果，并在浏览器本地合成最终图片。
 
-## 特性
+## 功能
 
-- 轻量独立，无需依赖原版大脚本
-- 使用 `==UserConfig==` 提供用户可配置项
-- 按域名和 CSS 选择器自动匹配需要翻译的图片
-- 自动监听动态内容，适配懒加载和局部刷新场景
-- 上传前自动缩放超大图片，避免超过接口常见限制
-- 采用油猴跨域请求能力下载原图、提交任务、轮询结果
-- 在屏幕右下角显示全局翻译进度
-- 提示面板鼠标穿透，不影响查看图片或原页面交互
+- 按域名和 CSS 选择器自动翻译图片
+- 监听动态内容，适配懒加载和局部刷新
+- 上传前自动缩放超大图片
+- 显示全局翻译进度
+- 缓存最近翻译结果，默认 100 张，支持持久化缓存
+- 支持脚本菜单：切换本站翻译、清空缓存、下载缓存中的翻译图片
 
-## 工作原理
+## 安装
 
-脚本会在命中的页面里：
-
-1. 找出符合站点规则的 `img` 元素
-2. 下载图片原始内容
-3. 将图片提交给 Cotrans 服务
-4. 轮询翻译进度直到完成
-5. 下载翻译结果图层
-6. 在本地 Canvas 中与原图合成
-7. 用合成后的图片替换页面中的原图片
-
-## 安装方式
-
-1. 安装支持 `GM.xmlHttpRequest` 与 `GM.getValue` 的用户脚本管理器
-   - 例如 Tampermonkey、Violentmonkey
+1. 安装 Tampermonkey 或 Violentmonkey
 2. 导入 `auto-image-translator.user.js`
-3. 在脚本管理器中打开脚本配置面板
-4. 填写站点规则和必要参数
+3. 在脚本配置里填写站点规则
 
-## 必要配置
+## 站点规则
 
-这个脚本最关键的配置是站点规则。
-
-### `site.rulesText`
-
-每行一条规则，格式如下：
+`site.rulesText` 每行一条，格式：
 
 ```text
 hostname|selector
 ```
 
-例如：
+示例：
 
 ```text
 www.pixiv.net|img
-twitter.com|article img
 x.com|article img
 ```
 
-含义：
-- `hostname`：要匹配的域名
-- `selector`：在该域名页面中需要自动翻译的图片选择器
+## 主要配置
 
-如果没有正确配置这个字段，脚本不会找到任何要翻译的图片。
+### basic
 
-## 主要配置项
+- `pollInterval`：轮询间隔
+- `pollTimeout`：轮询超时
+- `maxImageSize`：上传前最大边长
+- `recentImageCacheSize`：最近图片缓存数，`0` 表示禁用
 
-### 基础配置
+### translation
 
-- `basic.apiBaseUrl`
-  - Cotrans API 地址
-  - 默认值：`https://api.cotrans.touhou.ai`
+- `apiBaseUrl`：Cotrans API 地址
+- `requestTimeout`：请求超时
+- `targetLanguage`：目标语言，如 `CHS` / `ENG`
+- `translator`：翻译器
+- `textDetector`：文本检测器
+- `renderTextOrientation`：文本方向
+- `detectionResolution`：检测分辨率
+- `forceRetry`：强制重新翻译
 
-- `basic.pollInterval`
-  - 轮询翻译任务状态的间隔，单位毫秒
+## 菜单
 
-- `basic.pollTimeout`
-  - 单个翻译任务的最长等待时间，单位毫秒
+- `切换本站翻译`：临时关闭/恢复当前站点翻译；关闭时恢复原图
+- `清空翻译缓存`：清空内存和持久化缓存
+- `下载翻译图片`：按缓存中的请求时间顺序下载图片
 
-- `basic.maxImageSize`
-  - 上传前允许的最大图片边长，超出时会自动缩放
+下载文件名格式：
 
-- `basic.requestTimeout`
-  - 单次网络请求超时，单位毫秒
+```text
+时间戳_小数_哈希值.后缀名
+```
 
-### 翻译配置
+例如：
 
-- `translation.targetLanguage`
-  - 目标语言代码
-  - 常见示例：`CHS`、`CHT`、`JPN`、`ENG`
+```text
+1712345678901_001_abcd1234.png
+```
 
-- `translation.translator`
-  - 发送给 Cotrans API 的 `translator` 参数
-  - 默认值：`gpt3.5`
+## 说明
 
-- `translation.textDetector`
-  - 发送给 Cotrans API 的 `detector` 参数
-  - 默认值：`default`
-
-- `translation.renderTextOrientation`
-  - 发送给 Cotrans API 的 `direction` 参数
-  - 可选值：`auto`、`horizontal`、`vertical`
-
-- `translation.detectionResolution`
-  - 发送给 Cotrans API 的 `size` 参数
-  - 可选值：`S`、`M`、`L`、`X`
-
-- `translation.forceRetry`
-  - 是否忽略服务端缓存并强制重新翻译
-
-## 当前实现边界
-
-当前脚本主要面向常规网页中的 `img` 元素，适合以下场景：
-- 普通图片列表
-- 动态插入的图片节点
-- 懒加载后 `src` / `srcset` 变化的图片
-
-当前不保证完美覆盖以下情况：
-- 背景图 `background-image`
-- 复杂的 `<picture>` / `<source>` 自定义取图逻辑
-- 需要专门鉴权或特殊 Referer 策略的站点
-- 站点本身对原图链接做了严格保护的场景
-
-## 注意事项
-
-- 本项目依赖 [Cotrans](https://cotrans.touhou.ai/) 的在线服务能力
-- 请合理控制调用频率，避免在大量图片页面上无差别翻译
-- 若某些站点图片无法下载，通常需要更具体的站点规则或额外适配
-- 翻译结果质量与服务端检测器、翻译器、原图清晰度有关
-
-## 项目文件
-
-- `auto-image-translator.user.js`：主脚本
-- `用户配置.md`：`==UserConfig==` 用法说明
-- `a.user.js`：参考 API 来源脚本
+- 主要面向普通网页中的 `img` 元素
+- 不处理 `background-image` 等非 `img` 场景
+- 翻译效果和可用性依赖目标站点、原图质量与 Cotrans 服务
