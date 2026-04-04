@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lightweight Auto Image Translator
 // @name:zh-CN   轻量自动图片翻译器
-// @namespace    https://cotrans.touhou.ai/userscript/#lightweight-auto
+// @namespace    https://github.com/ApliNi/auto-image-translator.user.js
 // @version      0.1.0
 // @description  Automatically translate matched images on configured websites
 // @description:zh-CN  在配置的网站上自动翻译匹配选择器内的所有图片
@@ -121,15 +121,34 @@ const GMX = (() => {
   }
 
   return (options) => new Promise((resolve, reject) => {
+    let settled = false
+    const resolveOnce = (value) => {
+      if (settled) return
+      settled = true
+      resolve(value)
+    }
+    const rejectOnce = (error) => {
+      if (settled) return
+      settled = true
+      reject(error)
+    }
     xmlHttpRequest({
       ...options,
       onload(response) {
         options.onload?.(response)
-        resolve(response)
+        resolveOnce(response)
       },
       onerror(error) {
         options.onerror?.(error)
-        reject(error)
+        rejectOnce(error)
+      },
+      ontimeout(error) {
+        options.ontimeout?.(error)
+        rejectOnce(error || new Error('[Auto Image Translator] request timed out'))
+      },
+      onabort(error) {
+        options.onabort?.(error)
+        rejectOnce(error || new Error('[Auto Image Translator] request aborted'))
       },
     })
   })
@@ -286,6 +305,156 @@ let translationProgress = {
   total: 0,
   done: 0,
 }
+const SCAN_TIME_BUDGET_MS = 12
+const SCAN_ROOT_BATCH_SIZE = 16
+const TRANSLATION_QUEUE_TIMEOUT_MS = 120
+const PROGRESS_RENDER_DEBOUNCE_MS = 120
+const PERSISTENT_CACHE_PRUNE_DELAY_MS = 3000
+const VISIBILITY_ROOT_MARGIN = '400px 0px'
+const DEFAULT_TRANSLATION_CONCURRENCY = Math.max(4, Math.min(10, Number(globalThis.navigator?.hardwareConcurrency) || 6))
+const CPU_STAGE_CONCURRENCY = 1
+const APPLY_BATCH_SIZE = 1
+const SCROLL_IDLE_WINDOW_MS = 180
+const SCROLL_CPU_MAX_WAIT_MS = 800
+const SCROLL_APPLY_MAX_WAIT_MS = 1200
+const SCROLL_POLL_INTERVAL_MS = 50
+const pendingScanRoots = new Set()
+const pendingTranslationElements = new Set()
+const pendingApplyEntries = []
+let scanFlushScheduled = false
+let translationFlushScheduled = false
+let applyFlushScheduled = false
+let activeTranslationCount = 0
+let progressRenderTimer = 0
+let persistentCachePruneTimer = 0
+let persistentCachePrunePromise = null
+let persistentCachePruneRequested = false
+let visibilityObserver = null
+let translationSessionGeneration = 0
+let lastScrollAt = 0
+let scrollTrackingStarted = false
+let imageWorker = null
+let imageWorkerPromise = null
+let imageWorkerAvailable = true
+let imageWorkerTaskId = 0
+const imageWorkerTasks = new Map()
+const cpuStageGate = {
+  activeCount: 0,
+  waiters: [],
+}
+
+function buildImageWorkerSource() {
+  return String.raw`
+    let offscreenCanvasSupported = typeof OffscreenCanvas !== 'undefined'
+      && typeof OffscreenCanvas.prototype?.getContext === 'function'
+      && typeof OffscreenCanvas.prototype?.convertToBlob === 'function'
+    let imageBitmapSupported = typeof createImageBitmap === 'function'
+    let subtleSupported = !!globalThis.crypto?.subtle
+
+    async function sha256Hex(blob) {
+      if (!subtleSupported) {
+        const error = new Error('crypto.subtle is unavailable in worker')
+        error.code = 'UNSUPPORTED'
+        throw error
+      }
+      const buffer = await blob.arrayBuffer()
+      const digest = await crypto.subtle.digest('SHA-256', buffer)
+      const bytes = new Uint8Array(digest)
+      return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
+    }
+
+    async function decodeImage(blob) {
+      if (!imageBitmapSupported) {
+        const error = new Error('createImageBitmap is unavailable in worker')
+        error.code = 'UNSUPPORTED'
+        throw error
+      }
+      return createImageBitmap(blob)
+    }
+
+    function createCanvas(width, height) {
+      if (!offscreenCanvasSupported) {
+        const error = new Error('OffscreenCanvas is unavailable in worker')
+        error.code = 'UNSUPPORTED'
+        throw error
+      }
+      return new OffscreenCanvas(width, height)
+    }
+
+    async function resizeImage(blob, suffix, maxImageSize) {
+      const image = await decodeImage(blob)
+      try {
+        const width = image.width
+        const height = image.height
+        if (width <= maxImageSize && height <= maxImageSize) {
+          return { blob, suffix }
+        }
+        const scale = Math.min(maxImageSize / width, maxImageSize / height)
+        const resizedWidth = Math.floor(width * scale)
+        const resizedHeight = Math.floor(height * scale)
+        const canvas = createCanvas(resizedWidth, resizedHeight)
+        const context = canvas.getContext('2d')
+        if (!context) {
+          throw new Error('Canvas 2D context is unavailable in worker')
+        }
+        context.imageSmoothingQuality = 'high'
+        context.drawImage(image, 0, 0, resizedWidth, resizedHeight)
+        const resizedBlob = await canvas.convertToBlob({ type: 'image/png' })
+        return {
+          blob: resizedBlob,
+          suffix: 'png',
+        }
+      } finally {
+        image.close?.()
+      }
+    }
+
+    async function mergeImages(baseBlob, maskBlob) {
+      const [baseImage, maskImage] = await Promise.all([
+        decodeImage(baseBlob),
+        decodeImage(maskBlob),
+      ])
+      try {
+        const canvas = createCanvas(baseImage.width, baseImage.height)
+        const context = canvas.getContext('2d')
+        if (!context) {
+          throw new Error('Canvas 2D context is unavailable in worker')
+        }
+        context.drawImage(baseImage, 0, 0)
+        context.drawImage(maskImage, 0, 0)
+        return canvas.convertToBlob({ type: 'image/png' })
+      } finally {
+        baseImage.close?.()
+        maskImage.close?.()
+      }
+    }
+
+    self.onmessage = async (event) => {
+      const { id, type, payload } = event.data || {}
+      try {
+        let result
+        if (type === 'sha256') {
+          result = { imageHash: await sha256Hex(payload.blob) }
+        } else if (type === 'resize') {
+          result = await resizeImage(payload.blob, payload.suffix, payload.maxImageSize)
+        } else if (type === 'merge') {
+          result = { blob: await mergeImages(payload.baseBlob, payload.maskBlob) }
+        } else {
+          throw new Error('Unknown worker task type')
+        }
+        self.postMessage({ id, result })
+      } catch (error) {
+        self.postMessage({
+          id,
+          error: {
+            message: error?.message || String(error),
+            code: error?.code || '',
+          },
+        })
+      }
+    }
+  `
+}
 
 function log(...args) {
   console.log('[Auto Image Translator]', ...args)
@@ -379,16 +548,24 @@ function renderProgressPanel() {
     : `翻译完成 ${translationProgress.done}/${translationProgress.total}`
 }
 
+function scheduleProgressRender() {
+  if (progressRenderTimer) return
+  progressRenderTimer = window.setTimeout(() => {
+    progressRenderTimer = 0
+    renderProgressPanel()
+  }, PROGRESS_RENDER_DEBOUNCE_MS)
+}
+
 function beginTranslationFor(img) {
   if (processingElements.has(img)) return false
   translationProgress.total += 1
-  renderProgressPanel()
+  scheduleProgressRender()
   return true
 }
 
 function finishTranslationFor(img) {
   translationProgress.done += 1
-  renderProgressPanel()
+  scheduleProgressRender()
 }
 
 function resetProgressIfIdle() {
@@ -397,8 +574,205 @@ function resetProgressIfIdle() {
   window.setTimeout(() => {
     if (translationProgress.done < translationProgress.total) return
     translationProgress = { total: 0, done: 0 }
-    renderProgressPanel()
+    scheduleProgressRender()
   }, 1200)
+}
+
+function runWhenMainThreadAvailable(callback, timeout = TRANSLATION_QUEUE_TIMEOUT_MS) {
+  if (typeof requestIdleCallback === 'function') {
+    requestIdleCallback(callback, { timeout })
+    return
+  }
+  window.setTimeout(() => {
+    callback({
+      didTimeout: true,
+      timeRemaining: () => 0,
+    })
+  }, 0)
+}
+
+function nextAnimationFrame() {
+  return new Promise((resolve) => {
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(() => resolve())
+      return
+    }
+    window.setTimeout(resolve, 16)
+  })
+}
+
+function delay(ms) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms)
+  })
+}
+
+function noteUserScrollActivity() {
+  lastScrollAt = Date.now()
+}
+
+function isWithinScrollWindow() {
+  return Date.now() - lastScrollAt < SCROLL_IDLE_WINDOW_MS
+}
+
+async function waitForScrollIdle(maxWaitMs) {
+  if (!isWithinScrollWindow()) return
+  const startedAt = Date.now()
+  while (isWithinScrollWindow()) {
+    if (Date.now() - startedAt >= maxWaitMs) {
+      return
+    }
+    await delay(SCROLL_POLL_INTERVAL_MS)
+  }
+}
+
+function startScrollTracking() {
+  if (scrollTrackingStarted) return
+  const listenerOptions = { passive: true, capture: true }
+  window.addEventListener('scroll', noteUserScrollActivity, listenerOptions)
+  window.addEventListener('wheel', noteUserScrollActivity, listenerOptions)
+  window.addEventListener('touchmove', noteUserScrollActivity, listenerOptions)
+  scrollTrackingStarted = true
+}
+
+function acquireConcurrencySlot(gate, limit) {
+  if (gate.activeCount < limit) {
+    gate.activeCount += 1
+    return Promise.resolve()
+  }
+  return new Promise((resolve) => {
+    gate.waiters.push(resolve)
+  }).then(() => {
+    gate.activeCount += 1
+  })
+}
+
+function releaseConcurrencySlot(gate) {
+  gate.activeCount = Math.max(0, gate.activeCount - 1)
+  const nextResolve = gate.waiters.shift()
+  if (nextResolve) {
+    nextResolve()
+  }
+}
+
+async function ensureImageWorker() {
+  if (!imageWorkerAvailable) return null
+  if (imageWorker) return imageWorker
+  if (imageWorkerPromise) return imageWorkerPromise
+  imageWorkerPromise = Promise.resolve().then(() => {
+    if (typeof Worker === 'undefined' || typeof URL?.createObjectURL !== 'function') {
+      imageWorkerAvailable = false
+      return null
+    }
+    const source = buildImageWorkerSource()
+    const blob = new Blob([source], { type: 'text/javascript' })
+    const workerUrl = URL.createObjectURL(blob)
+    try {
+      const worker = new Worker(workerUrl)
+      worker.onmessage = (event) => {
+        const { id, result, error } = event.data || {}
+        const task = imageWorkerTasks.get(id)
+        if (!task) return
+        imageWorkerTasks.delete(id)
+        if (error) {
+          const workerError = new Error(error.message || 'Worker task failed')
+          workerError.code = error.code || ''
+          task.reject(workerError)
+          return
+        }
+        task.resolve(result)
+      }
+      worker.onmessageerror = (event) => {
+        imageWorkerAvailable = false
+        const error = new Error(event?.message || '[Auto Image Translator] image worker message error')
+        for (const [, task] of imageWorkerTasks) {
+          task.reject(error)
+        }
+        imageWorkerTasks.clear()
+        try {
+          worker.terminate()
+        } catch (terminateError) {
+          log('terminate image worker failed', terminateError)
+        }
+        imageWorker = null
+      }
+      worker.onerror = (event) => {
+        imageWorkerAvailable = false
+        const error = event?.error || new Error(event?.message || '[Auto Image Translator] image worker crashed')
+        for (const [, task] of imageWorkerTasks) {
+          task.reject(error)
+        }
+        imageWorkerTasks.clear()
+        try {
+          worker.terminate()
+        } catch (terminateError) {
+          log('terminate image worker failed', terminateError)
+        }
+        imageWorker = null
+      }
+      imageWorker = worker
+      return worker
+    } catch (error) {
+      imageWorkerAvailable = false
+      return null
+    } finally {
+      URL.revokeObjectURL(workerUrl)
+    }
+  }).finally(() => {
+    imageWorkerPromise = null
+  })
+  return imageWorkerPromise
+}
+
+async function runImageWorkerTask(type, payload, transfer = []) {
+  const worker = await ensureImageWorker()
+  if (!worker) {
+    return null
+  }
+  return new Promise((resolve, reject) => {
+    const id = `image-worker-${++imageWorkerTaskId}`
+    imageWorkerTasks.set(id, { resolve, reject })
+    try {
+      worker.postMessage({ id, type, payload }, transfer)
+    } catch (error) {
+      imageWorkerTasks.delete(id)
+      reject(error)
+    }
+  })
+}
+
+function shouldReleaseTranslatedUrl(imageUrl, translatedUrl) {
+  if (!translatedUrl || !translatedUrl.startsWith('blob:')) return false
+  return translatedImageCache.get(imageUrl) !== translatedUrl
+}
+
+function releaseTranslatedUrlIfOwned(imageUrl, translatedUrl) {
+  if (!shouldReleaseTranslatedUrl(imageUrl, translatedUrl)) return
+  URL.revokeObjectURL(translatedUrl)
+}
+
+async function runCpuStage(task) {
+  await acquireConcurrencySlot(cpuStageGate, CPU_STAGE_CONCURRENCY)
+  try {
+    await waitForScrollIdle(SCROLL_CPU_MAX_WAIT_MS)
+    await nextAnimationFrame()
+    return await task()
+  } finally {
+    releaseConcurrencySlot(cpuStageGate)
+  }
+}
+
+async function yieldAfterHeavyStage() {
+  await nextAnimationFrame()
+}
+
+function shouldYieldToMainThread(deadline, startedAt, processedCount, batchSize = SCAN_ROOT_BATCH_SIZE) {
+  if (processedCount >= batchSize) return true
+  if (deadline?.didTimeout) return false
+  if (typeof deadline?.timeRemaining === 'function' && deadline.timeRemaining() <= 1) {
+    return true
+  }
+  return performance.now() - startedAt >= SCAN_TIME_BUDGET_MS
 }
 
 function assertOkResponse(response, label) {
@@ -494,13 +868,24 @@ function openPersistentCacheDb() {
 }
 
 async function sha256Hex(blob) {
-  if (!crypto?.subtle) {
-    throw new Error('[Auto Image Translator] crypto.subtle is unavailable')
+  const workerResult = await runImageWorkerTask('sha256', { blob })
+    .catch((error) => {
+      imageWorkerAvailable = false
+      log('image worker sha256 failed, fallback to main thread', error)
+      return null
+    })
+  if (workerResult?.imageHash) {
+    return workerResult.imageHash
   }
-  const buffer = await blob.arrayBuffer()
-  const digest = await crypto.subtle.digest('SHA-256', buffer)
-  const bytes = new Uint8Array(digest)
-  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
+  return runCpuStage(async () => {
+    if (!crypto?.subtle) {
+      throw new Error('[Auto Image Translator] crypto.subtle is unavailable')
+    }
+    const buffer = await blob.arrayBuffer()
+    const digest = await crypto.subtle.digest('SHA-256', buffer)
+    const bytes = new Uint8Array(digest)
+    return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
+  })
 }
 
 function getPersistentCacheKey(imageHash) {
@@ -615,6 +1000,25 @@ async function prunePersistentCache() {
   await transactionToPromise(transaction, 'prune persistent cache')
 }
 
+function schedulePersistentCachePrune() {
+  persistentCachePruneRequested = true
+  if (persistentCachePruneTimer || persistentCachePrunePromise) return
+  persistentCachePruneTimer = window.setTimeout(() => {
+    persistentCachePruneTimer = 0
+    persistentCachePruneRequested = false
+    persistentCachePrunePromise = prunePersistentCache()
+      .catch((error) => {
+        log('persistent cache prune failed', error)
+      })
+      .finally(() => {
+        persistentCachePrunePromise = null
+        if (persistentCachePruneRequested) {
+          schedulePersistentCachePrune()
+        }
+      })
+  }, PERSISTENT_CACHE_PRUNE_DELAY_MS)
+}
+
 async function getPersistentTranslatedBlob(cacheKey) {
   const entry = await readPersistentCacheEntry(cacheKey)
   if (!entry?.blob) return null
@@ -639,7 +1043,7 @@ async function setPersistentTranslatedBlob(cacheKey, imageHash, translatedBlob) 
     lastAccessedAt: now,
   })
   await transactionToPromise(transaction, `write persistent cache ${cacheKey}`)
-  await prunePersistentCache()
+  schedulePersistentCachePrune()
 }
 
 function clearTranslatedImageCache() {
@@ -654,6 +1058,11 @@ function clearTranslationTaskCache() {
 }
 
 async function clearPersistentCache() {
+  if (persistentCachePruneTimer) {
+    window.clearTimeout(persistentCachePruneTimer)
+    persistentCachePruneTimer = 0
+  }
+  persistentCachePruneRequested = false
   const db = await openPersistentCacheDb()
   if (!db) return
   const transaction = db.transaction(PERSISTENT_CACHE_STORE_NAME, 'readwrite')
@@ -734,6 +1143,11 @@ async function downloadCachedTranslatedImages() {
 
 async function clearAllCaches() {
   cacheGeneration += 1
+  translationSessionGeneration += 1
+  clearScheduledWork()
+  translationProgress = { total: 0, done: 0 }
+  scheduleProgressRender()
+  restoreOriginalImages()
   clearTranslationTaskCache()
   clearTranslatedImageCache()
   await clearPersistentCache()
@@ -761,13 +1175,18 @@ async function toggleSiteTranslation() {
   const nextEnabled = !siteTranslationEnabled
   await setSiteTranslationEnabled(nextEnabled)
   if (!nextEnabled) {
+    translationSessionGeneration += 1
+    clearScheduledWork()
+    translationProgress = { total: 0, done: 0 }
+    scheduleProgressRender()
     restoreOriginalImages()
     log('site translation disabled', { hostname: location.hostname })
     return
   }
+  translationSessionGeneration += 1
   log('site translation enabled', { hostname: location.hostname })
   if (currentRule) {
-    scheduleTranslate(currentRule)
+    enqueueInitialScan(currentRule)
   }
 }
 
@@ -840,38 +1259,96 @@ async function blobToImage(blob) {
   }
 }
 
-async function resizeToSubmit(blob, suffix) {
-  const img = await blobToImage(blob)
-  const width = img.width
-  const height = img.height
-  if (width <= CONFIG.maxImageSize && height <= CONFIG.maxImageSize) {
-    return { blob, suffix }
+async function decodeImage(blob) {
+  if (typeof createImageBitmap === 'function') {
+    try {
+      return await createImageBitmap(blob)
+    } catch (error) {
+      log('createImageBitmap failed, fallback to Image()', error)
+    }
   }
-  const scale = Math.min(CONFIG.maxImageSize / width, CONFIG.maxImageSize / height)
-  const resizedWidth = Math.floor(width * scale)
-  const resizedHeight = Math.floor(height * scale)
+  return blobToImage(blob)
+}
+
+function releaseDecodedImage(image) {
+  image?.close?.()
+}
+
+function createCanvasSurface(width, height) {
+  if (
+    typeof OffscreenCanvas !== 'undefined'
+    && typeof OffscreenCanvas.prototype?.getContext === 'function'
+    && typeof OffscreenCanvas.prototype?.convertToBlob === 'function'
+  ) {
+    return new OffscreenCanvas(width, height)
+  }
   const canvas = document.createElement('canvas')
-  canvas.width = resizedWidth
-  canvas.height = resizedHeight
+  canvas.width = width
+  canvas.height = height
+  return canvas
+}
+
+function getCanvasContext(canvas) {
   const context = canvas.getContext('2d')
   if (!context) {
     throw new Error('[Auto Image Translator] Canvas 2D context is unavailable')
   }
-  context.imageSmoothingQuality = 'high'
-  context.drawImage(img, 0, 0, resizedWidth, resizedHeight)
-  const resizedBlob = await new Promise((resolve, reject) => {
-    canvas.toBlob((nextBlob) => {
-      if (nextBlob) {
-        resolve(nextBlob)
+  return context
+}
+
+async function canvasToBlob(canvas, type = 'image/png') {
+  if (typeof canvas.convertToBlob === 'function') {
+    return canvas.convertToBlob({ type })
+  }
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (blob) {
+        resolve(blob)
         return
       }
       reject(new Error('[Auto Image Translator] Canvas toBlob failed'))
-    }, 'image/png')
+    }, type)
   })
-  return {
-    blob: resizedBlob,
-    suffix: 'png',
+}
+
+async function resizeToSubmit(blob, suffix) {
+  const workerResult = await runImageWorkerTask('resize', {
+    blob,
+    suffix,
+    maxImageSize: CONFIG.maxImageSize,
+  }).catch((error) => {
+    imageWorkerAvailable = false
+    log('image worker resize failed, fallback to main thread', error)
+    return null
+  })
+  if (workerResult?.blob instanceof Blob) {
+    return workerResult
   }
+  return runCpuStage(async () => {
+    const img = await decodeImage(blob)
+    const width = img.width
+    const height = img.height
+    if (width <= CONFIG.maxImageSize && height <= CONFIG.maxImageSize) {
+      releaseDecodedImage(img)
+      return { blob, suffix }
+    }
+    const scale = Math.min(CONFIG.maxImageSize / width, CONFIG.maxImageSize / height)
+    const resizedWidth = Math.floor(width * scale)
+    const resizedHeight = Math.floor(height * scale)
+    const canvas = createCanvasSurface(resizedWidth, resizedHeight)
+    try {
+      const context = getCanvasContext(canvas)
+      context.imageSmoothingQuality = 'high'
+      context.drawImage(img, 0, 0, resizedWidth, resizedHeight)
+      const resizedBlob = await canvasToBlob(canvas, 'image/png')
+      return {
+        blob: resizedBlob,
+        suffix: 'png',
+      }
+    } finally {
+      releaseDecodedImage(img)
+    }
+  })
 }
 
 async function downloadBlob(url, headers = {}) {
@@ -925,27 +1402,32 @@ async function pullTranslationStatusPolling(id) {
 }
 
 async function mergeImages(baseBlob, maskBlob) {
-  const [baseImage, maskImage] = await Promise.all([
-    blobToImage(baseBlob),
-    blobToImage(maskBlob),
-  ])
-  const canvas = document.createElement('canvas')
-  canvas.width = baseImage.width
-  canvas.height = baseImage.height
-  const context = canvas.getContext('2d')
-  if (!context) {
-    throw new Error('[Auto Image Translator] Canvas 2D context is unavailable')
+  const workerResult = await runImageWorkerTask('merge', {
+    baseBlob,
+    maskBlob,
+  }).catch((error) => {
+    imageWorkerAvailable = false
+    log('image worker merge failed, fallback to main thread', error)
+    return null
+  })
+  if (workerResult?.blob instanceof Blob) {
+    return workerResult.blob
   }
-  context.drawImage(baseImage, 0, 0)
-  context.drawImage(maskImage, 0, 0)
-  return new Promise((resolve, reject) => {
-    canvas.toBlob((blob) => {
-      if (blob) {
-        resolve(blob)
-        return
-      }
-      reject(new Error('[Auto Image Translator] Canvas toBlob failed'))
-    }, 'image/png')
+  return runCpuStage(async () => {
+    const [baseImage, maskImage] = await Promise.all([
+      decodeImage(baseBlob),
+      decodeImage(maskBlob),
+    ])
+    const canvas = createCanvasSurface(baseImage.width, baseImage.height)
+    try {
+      const context = getCanvasContext(canvas)
+      context.drawImage(baseImage, 0, 0)
+      context.drawImage(maskImage, 0, 0)
+      return await canvasToBlob(canvas, 'image/png')
+    } finally {
+      releaseDecodedImage(baseImage)
+      releaseDecodedImage(maskImage)
+    }
   })
 }
 
@@ -970,6 +1452,7 @@ async function translateImageUrl(imageUrl) {
       originalBlob = await downloadBlob(imageUrl, { referer: refererUrl })
     }
     const imageHash = await sha256Hex(originalBlob)
+    await yieldAfterHeavyStage()
     const persistentCacheKey = getPersistentCacheKey(imageHash)
     if (!CONFIG.forceRetry && taskGeneration === cacheGeneration) {
       try {
@@ -984,6 +1467,7 @@ async function translateImageUrl(imageUrl) {
     }
     const originalSuffix = getFileSuffix(imageUrl)
     const resized = await resizeToSubmit(originalBlob, originalSuffix)
+    await yieldAfterHeavyStage()
     const submission = await submitTranslate(resized.blob, resized.suffix)
     let maskUrl = submission.result?.translation_mask
     if (!maskUrl) {
@@ -995,6 +1479,7 @@ async function translateImageUrl(imageUrl) {
     }
     const maskBlob = await downloadBlob(maskUrl)
     const translatedBlob = await mergeImages(resized.blob, maskBlob)
+    await yieldAfterHeavyStage()
     const translatedUrl = URL.createObjectURL(translatedBlob)
     if (taskGeneration === cacheGeneration) {
       try {
@@ -1004,7 +1489,8 @@ async function translateImageUrl(imageUrl) {
       }
       return cacheTranslatedImageUrl(imageUrl, translatedUrl)
     }
-    return translatedUrl
+    URL.revokeObjectURL(translatedUrl)
+    return ''
   })()
   translationTaskCache.set(imageUrl, {
     generation: taskGeneration,
@@ -1020,8 +1506,76 @@ async function translateImageUrl(imageUrl) {
   }
 }
 
+function scheduleApplyFlush() {
+  if (applyFlushScheduled) return
+  applyFlushScheduled = true
+  void nextAnimationFrame().then(async () => {
+    applyFlushScheduled = false
+    await waitForScrollIdle(SCROLL_APPLY_MAX_WAIT_MS)
+    let appliedCount = 0
+    while (pendingApplyEntries.length > 0 && appliedCount < APPLY_BATCH_SIZE) {
+      const entry = pendingApplyEntries.shift()
+      if (!entry) break
+      const {
+        img,
+        imageUrl,
+        translatedUrl,
+        sessionGeneration,
+        resolve,
+      } = entry
+      try {
+        if (!siteTranslationEnabled) {
+          releaseTranslatedUrlIfOwned(imageUrl, translatedUrl)
+          resolve(false)
+          continue
+        }
+        if (sessionGeneration !== translationSessionGeneration) {
+          releaseTranslatedUrlIfOwned(imageUrl, translatedUrl)
+          resolve(false)
+          continue
+        }
+        if (!(img instanceof HTMLImageElement) || !img.isConnected) {
+          releaseTranslatedUrlIfOwned(imageUrl, translatedUrl)
+          resolve(false)
+          continue
+        }
+        if (getImageUrl(img) !== imageUrl) {
+          releaseTranslatedUrlIfOwned(imageUrl, translatedUrl)
+          resolve(false)
+          continue
+        }
+        img.src = translatedUrl
+        img.removeAttribute('srcset')
+        elementSourceCache.set(img, imageUrl)
+        resolve(true)
+        appliedCount += 1
+      } catch (error) {
+        releaseTranslatedUrlIfOwned(imageUrl, translatedUrl)
+        resolve(false)
+      }
+    }
+    if (pendingApplyEntries.length > 0) {
+      scheduleApplyFlush()
+    }
+  })
+}
+
+function enqueueApplyResult(img, imageUrl, translatedUrl, sessionGeneration) {
+  return new Promise((resolve) => {
+    pendingApplyEntries.push({
+      img,
+      imageUrl,
+      translatedUrl,
+      sessionGeneration,
+      resolve,
+    })
+    scheduleApplyFlush()
+  })
+}
+
 async function translateImageElement(img) {
   if (!siteTranslationEnabled) return
+  const sessionGeneration = translationSessionGeneration
   if (!shouldTranslate(img)) return
   const imageUrl = getImageUrl(img)
   if (!imageUrl) return
@@ -1032,12 +1586,8 @@ async function translateImageElement(img) {
   processingElements.add(img)
   try {
     const translatedUrl = await translateImageUrl(imageUrl)
-    if (!siteTranslationEnabled) return
-    if (!img.isConnected) return
-    if (getImageUrl(img) !== imageUrl) return
-    img.src = translatedUrl
-    img.removeAttribute('srcset')
-    elementSourceCache.set(img, imageUrl)
+    if (!translatedUrl) return
+    await enqueueApplyResult(img, imageUrl, translatedUrl, sessionGeneration)
   } catch (error) {
     log('translate failed', imageUrl, error)
   } finally {
@@ -1056,20 +1606,153 @@ function collectMatchedImages(rule, root = document) {
   return elements.concat(Array.from(scope.querySelectorAll(rule.selector)))
 }
 
+function isMatchedImage(rule, img) {
+  if (!(img instanceof HTMLImageElement)) return false
+  return img.matches(rule.selector)
+}
+
+function ensureVisibilityObserver() {
+  if (visibilityObserver || typeof IntersectionObserver === 'undefined') {
+    return visibilityObserver
+  }
+  visibilityObserver = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (!(entry.target instanceof HTMLImageElement)) continue
+      if (entry.isIntersecting || entry.intersectionRatio > 0) {
+        enqueueTranslation(entry.target)
+      }
+    }
+  }, {
+    root: null,
+    rootMargin: VISIBILITY_ROOT_MARGIN,
+    threshold: 0.01,
+  })
+  return visibilityObserver
+}
+
+function observeImageVisibility(img) {
+  if (!(img instanceof HTMLImageElement)) return
+  const observer = ensureVisibilityObserver()
+  if (!observer) {
+    enqueueTranslation(img)
+    return
+  }
+  observer.observe(img)
+}
+
+function scheduleTranslationFlush() {
+  if (translationFlushScheduled) return
+  translationFlushScheduled = true
+  runWhenMainThreadAvailable(() => {
+    translationFlushScheduled = false
+    while (activeTranslationCount < DEFAULT_TRANSLATION_CONCURRENCY && pendingTranslationElements.size > 0) {
+      const img = pendingTranslationElements.values().next().value
+      pendingTranslationElements.delete(img)
+      if (!(img instanceof HTMLImageElement)) continue
+      if (!siteTranslationEnabled || !shouldTranslate(img)) continue
+      activeTranslationCount += 1
+      void translateImageElement(img).finally(() => {
+        activeTranslationCount = Math.max(0, activeTranslationCount - 1)
+        scheduleTranslationFlush()
+      })
+    }
+  })
+}
+
+function enqueueTranslation(img) {
+  if (!(img instanceof HTMLImageElement)) return
+  if (!siteTranslationEnabled) return
+  visibilityObserver?.unobserve(img)
+  pendingTranslationElements.add(img)
+  scheduleTranslationFlush()
+}
+
+function registerMatchedImage(img, options = {}) {
+  if (!(img instanceof HTMLImageElement)) return
+  if (!siteTranslationEnabled) return
+  if (options.immediate) {
+    enqueueTranslation(img)
+    return
+  }
+  observeImageVisibility(img)
+}
+
+function scheduleScanFlush() {
+  if (scanFlushScheduled) return
+  scanFlushScheduled = true
+  runWhenMainThreadAvailable((deadline) => {
+    scanFlushScheduled = false
+    const startedAt = performance.now()
+    let processedCount = 0
+    while (pendingScanRoots.size > 0) {
+      const root = pendingScanRoots.values().next().value
+      pendingScanRoots.delete(root)
+      for (const img of collectMatchedImages(currentRule, root)) {
+        registerMatchedImage(img)
+      }
+      processedCount += 1
+      if (shouldYieldToMainThread(deadline, startedAt, processedCount)) {
+        break
+      }
+    }
+    if (pendingScanRoots.size > 0) {
+      scheduleScanFlush()
+    }
+  })
+}
+
+function enqueueInitialScan(rule) {
+  const roots = document.body?.children?.length
+    ? Array.from(document.body.children)
+    : [document]
+  for (const root of roots) {
+    pendingScanRoots.add(root)
+  }
+  if (document.body && document.body.matches(rule.selector)) {
+    pendingScanRoots.add(document.body)
+  }
+  scheduleScanFlush()
+}
+
 function scheduleTranslate(rule, root = document) {
-  for (const img of collectMatchedImages(rule, root)) {
-    translateImageElement(img)
+  if (!siteTranslationEnabled) return
+  const scope = root instanceof Element || root instanceof Document ? root : document
+  pendingScanRoots.add(scope)
+  scheduleScanFlush()
+}
+
+function clearScheduledWork() {
+  pendingScanRoots.clear()
+  pendingTranslationElements.clear()
+  while (pendingApplyEntries.length > 0) {
+    const entry = pendingApplyEntries.shift()
+    if (!entry) break
+    releaseTranslatedUrlIfOwned(entry.imageUrl, entry.translatedUrl)
+    entry.resolve(false)
+  }
+  if (visibilityObserver) {
+    visibilityObserver.disconnect()
+    visibilityObserver = null
   }
 }
 
 function startObserver(rule) {
   const observer = new MutationObserver((mutations) => {
+    if (!siteTranslationEnabled) return
     for (const mutation of mutations) {
       if (mutation.type === 'attributes' && mutation.target instanceof HTMLImageElement) {
-        translateImageElement(mutation.target)
+        if (isMatchedImage(rule, mutation.target)) {
+          registerMatchedImage(mutation.target, { immediate: true })
+        }
         continue
       }
       for (const node of mutation.addedNodes) {
+        if (node instanceof HTMLImageElement) {
+          if (isMatchedImage(rule, node)) {
+            registerMatchedImage(node)
+          }
+          continue
+        }
         if (node instanceof Element) {
           scheduleTranslate(rule, node)
         }
@@ -1087,6 +1770,7 @@ function startObserver(rule) {
 async function main() {
   CONFIG = await loadConfig()
   siteTranslationEnabled = await loadSiteTranslationEnabled()
+  startScrollTracking()
   registerMenuCommands()
   currentRule = getMatchedRule()
   if (!currentRule) {
@@ -1094,7 +1778,7 @@ async function main() {
     return
   }
   if (siteTranslationEnabled) {
-    scheduleTranslate(currentRule)
+    enqueueInitialScan(currentRule)
   }
   startObserver(currentRule)
   log('started', {
